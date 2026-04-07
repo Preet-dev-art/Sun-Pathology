@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     FIREBASE_CREDENTIALS_JSON: Optional[str] = None
 
     # CORS — override via env var on Render, e.g. '["https://your-app.vercel.app"]'
-    CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
+    CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173", "https://sun-pathology.vercel.app"]
 
     class Config:
         env_file = ".env"
