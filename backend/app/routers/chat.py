@@ -61,6 +61,12 @@ async def chat(request: ChatRequest):
     if is_booking_trigger(user_message, category) or current_booking_state is not None:
         return await _handle_booking_flow(session_id, user_message, language, category)
 
+    # ── Step 6b: Handle LEAD flow ──────────────────────────────────────────
+    current_lead_state, _ = db_service.get_lead_state(session_id)
+    from app.services.lead_service import is_lead_trigger
+    if is_lead_trigger(category) or current_lead_state is not None:
+        return await _handle_lead_flow(session_id, user_message, language, category)
+
     # ── Step 7: Build context for Gemini ──────────────────────────────────
     injected_context = ""
 
@@ -98,6 +104,11 @@ async def chat(request: ChatRequest):
         print("==========================", flush=True)
         # Graceful degradation — Sheetal apologises and gives contact number
         reply = _fallback_response(language)
+
+    # ── Auto-adjust language based on Gemini's reply ──────────────
+    reply_lang = detect_language(reply)
+    if reply_lang in ("en", "hi", "gu"):
+        language = reply_lang
 
     # ── Step 10: Save to Firestore ─────────────────────────────────────────
     db_service.append_message(session_id, "user", user_message)
@@ -144,7 +155,7 @@ async def _handle_report_inquiry(session_id, user_message, language, category) -
 
         reply = {
             "en": "Thank you. And the patient's name?",
-            "hi": "धन्यवाद। मरीज का नाम बताइए?",
+            "hi": "धन्यवाद। जिसका रिपोर्ट करवाना है उसका नाम बताइए?",
             "gu": "આભાર. દર્દીનું નામ શું છે?"
         }.get(language, "And the patient's name?")
 
@@ -226,6 +237,57 @@ async def _handle_booking_flow(session_id, user_message, language, category) -> 
         category=category,
         language=language,
         booking_state=next_state,
+    )
+
+
+async def _handle_lead_flow(session_id, user_message, language, category) -> ChatResponse:
+    """Delegate to the lead (corporate/society) state machine."""
+    from app.services.lead_service import advance_lead_state
+
+    db_service.append_message(session_id, "user", user_message)
+
+    next_state, step_prompt, is_complete = advance_lead_state(session_id, user_message)
+
+    if is_complete:
+        reply = {
+            "en": "Thank you. I have registered your details. Dr. Mayank Joshi will contact you shortly to plan the camp.",
+            "hi": "धन्यवाद। मैंने आपकी जानकारी दर्ज कर ली है। डॉ. मयंक जोशी जल्द ही आपसे संपर्क करेंगे।",
+            "gu": "આભાર. મેં તમારી માહિતી નોંધવી લીધી છે. ડૉ. મયંક જોશી ટૂંક સમયમાં તમારો સંપર્ક કરશે."
+        }.get(language, "Thank you. Dr. Mayank Joshi will contact you shortly.")
+
+        db_service.append_message(session_id, "assistant", reply)
+        return ChatResponse(
+            session_id=session_id,
+            reply=reply,
+            category=category,
+            language=language,
+            suggested_action="LEAD_SAVED"
+        )
+
+    # Use Gemini to generate a natural response for this step
+    system_prompt = build_system_prompt(mode="chat")
+    history = db_service.get_conversation_history(session_id)
+
+    reply = await generate_response(
+        user_message=user_message,
+        conversation_history=history[:-1],
+        system_prompt=system_prompt,
+        injected_context=f"[INQUIRY FLOW — CURRENT STEP]: {step_prompt}"
+    )
+
+    # ── Auto-adjust language based on Gemini's reply ──────────────
+    reply_lang = detect_language(reply)
+    if reply_lang in ("en", "hi", "gu"):
+        language = reply_lang
+
+    db_service.append_message(session_id, "assistant", reply)
+    db_service.update_session_meta(session_id, language=language, query_category=category)
+
+    return ChatResponse(
+        session_id=session_id,
+        reply=reply,
+        category=category,
+        language=language,
     )
 
 

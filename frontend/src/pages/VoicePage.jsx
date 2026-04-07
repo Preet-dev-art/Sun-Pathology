@@ -5,8 +5,7 @@ import { useCallSession } from "../hooks/useCallSession";
 import CallScreen from "../components/Voice/CallScreen";
 
 export default function VoicePage() {
-  const { sessionId } = useSession();
-
+  const { sessionId, resetSession } = useSession();
   const {
     callState,
     transcript,
@@ -19,6 +18,11 @@ export default function VoicePage() {
     endCall,
   } = useCallSession({ sessionId });
 
+  const handleEndCall = () => {
+    endCall();
+    resetSession();
+  };
+
   return (
     <div className="flex flex-col flex-1 h-[calc(100vh-64px)]">
       <CallScreen
@@ -30,7 +34,7 @@ export default function VoicePage() {
         callDuration={callDuration}
         error={error}
         onStartCall={startCall}
-        onEndCall={endCall}
+        onEndCall={handleEndCall}
       />
     </div>
   );

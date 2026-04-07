@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import json
+import re
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.services.call_manager import ActiveCall, register_call, get_call, end_call
@@ -10,7 +11,7 @@ from app.services.sarvam_service import transcribe_audio, text_to_speech
 from app.services.elevenlabs_service import text_to_speech_english
 from app.services import db_service
 from app.services.booking_service import is_booking_trigger, advance_booking_state
-from app.services.gemini_service import generate_response
+from app.services.gemini_service import generate_response, generate_response_stream
 from app.knowledge.lab_knowledge import (
     detect_language, classify_query, get_faq_answer
 )
@@ -25,9 +26,9 @@ router = APIRouter(prefix="/api/call", tags=["call"])
 
 # ── Greeting text per language ────────────────────────────────────────────────
 GREETINGS = {
-    "hi": "नमस्ते! मैं शीतल हूँ, सन पैथोलॉजी की रिसेप्शनिस्ट। बताइए, मैं आपकी कैसे मदद करूँ?",
-    "gu": "નમસ્તે! હું શીતળ છું, સન પેથોલૉજીની રિસેપ્શનિસ્ટ. બોલો, હું તમારી શી મદદ કરી શકું?",
-    "en": "Hello! I'm Sheetal, the receptionist at Sun Pathology. How can I help you today?",
+    "gu": "સન પેથોલૉજી લૅબોરેટરી ઍન્ડ રિસર્ચ ઇન્સ્ટિટ્યૂટનો સંપર્ક કરવા બદલ આભાર. આજે હું તમારી શું મદદ કરી શકું?",
+    "hi": "सन पैथोलॉजी लेबोरेटरी एंड रिसर्च इंस्टीट्यूट से संपर्क करने के लिए धन्यवाद। मैं आज आपकी कैसे सहायता कर सकती हूँ?",
+    "en": "Thank you for contacting Sun Pathology Laboratory & Research Institute. How may I assist you today?",
 }
 
 
@@ -101,13 +102,19 @@ async def call_websocket(websocket: WebSocket, session_id: str):
 
 # ── Greeting ──────────────────────────────────────────────────────────────────
 
+_GREETING_CACHE = {}
+
 async def _send_greeting(call: ActiveCall):
     """Generate greeting TTS and send to client."""
-    # Default to Hindi — update after first patient message detects language
-    lang = call.language
-    greeting_text = GREETINGS.get(lang, GREETINGS["hi"])
+    # Default to Gujarati — update after first patient message detects language
+    lang = call.language if call.language else "gu"
+    greeting_text = GREETINGS.get(lang, GREETINGS["gu"])
 
-    audio_b64, mime = await _synthesize_to_b64(greeting_text, lang)
+    if lang not in _GREETING_CACHE:
+        audio_b64, mime = await _synthesize_to_b64(greeting_text, lang)
+        _GREETING_CACHE[lang] = (audio_b64, mime)
+    else:
+        audio_b64, mime = _GREETING_CACHE[lang]
 
     await _send_json(call, {
         "type": "tts_audio",
@@ -149,12 +156,18 @@ async def _handle_patient_audio(call: ActiveCall, msg: dict):
                 # Too short / noise — ignore silently
                 return
 
-            # ── Detect language ───────────────────────────────────────────
+            # ── Detect language from grammar (not just script) ─────────
             detected = detect_language(transcript)
-            if detected in ("hi", "gu"):
+            if detected in ("hi", "gu", "en"):
                 call.language = detected
-            elif language_hint in ("hi", "gu", "en"):
-                call.language = language_hint
+
+            # If the grammar-based detector found a DIFFERENT language than
+            # what we told the STT, re-transcribe with the correct language
+            # so Gemini gets a clean, properly-scripted transcript.
+            if detected != language_hint and detected in ("hi", "gu"):
+                retranscript = await transcribe_audio(audio_bytes, language=detected)
+                if retranscript and len(retranscript.strip()) >= 2:
+                    transcript = retranscript
 
             language = call.language
 
@@ -197,6 +210,15 @@ async def _handle_patient_audio(call: ActiveCall, msg: dict):
                 await _send_tts(call, reply_text, audio_b64_reply, mime, language)
                 return
 
+            # ── Lead flow ───────────────────────────────────────────────
+            current_lead_state, _ = db_service.get_lead_state(call.session_id)
+            from app.services.lead_service import is_lead_trigger
+            if is_lead_trigger(category) or current_lead_state:
+                reply_text = await _handle_lead_flow(call, transcript, language, category)
+                audio_b64_reply, mime = await _synthesize_to_b64(reply_text, language)
+                await _send_tts(call, reply_text, audio_b64_reply, mime, language)
+                return
+
             # ── Build context ─────────────────────────────────────────────
             injected_context = ""
             if category in ("PRICING", "TESTS"):
@@ -213,12 +235,13 @@ async def _handle_patient_audio(call: ActiveCall, msg: dict):
             system_prompt = build_system_prompt(mode="voice")
 
             try:
-                reply_text = await generate_response(
+                stream_gen = generate_response_stream(
                     user_message=transcript,
                     conversation_history=history[:-1],
                     system_prompt=system_prompt,
                     injected_context=injected_context,
                 )
+                await _process_text_stream(call, stream_gen, language, category)
             except Exception as e:
                 import traceback
                 error_details = traceback.format_exc()
@@ -227,16 +250,8 @@ async def _handle_patient_audio(call: ActiveCall, msg: dict):
                 print(f"Traceback:\n{error_details}", flush=True)
                 print("===================================", flush=True)
                 reply_text = _fallback(language)
-
-            # ── Save reply ────────────────────────────────────────────────
-            db_service.append_message(call.session_id, "assistant", reply_text)
-            db_service.update_session_meta(
-                call.session_id, language=language, query_category=category
-            )
-
-            # ── TTS → send ────────────────────────────────────────────────
-            audio_b64_reply, mime = await _synthesize_to_b64(reply_text, language)
-            await _send_tts(call, reply_text, audio_b64_reply, mime, language)
+                audio_b64_reply, mime = await _synthesize_to_b64(reply_text, language)
+                await _send_tts(call, reply_text, audio_b64_reply, mime, language)
 
         except Exception as e:
             print(f"[CALL {call.session_id}] Pipeline error: {e}")
@@ -271,7 +286,7 @@ async def _handle_report_flow(call: ActiveCall, transcript: str, language: str) 
         db_service.update_session_meta(call.session_id, booking_data=booking_data)
         reply = {
             "en": "Thank you. And the patient's name?",
-            "hi": "धन्यवाद। मरीज का नाम बताइए?",
+            "hi": "धन्यवाद। जिसका रिपोर्ट करवाना है उसका नाम बताइए?",
             "gu": "આભાર. દર્દીનું નામ શું છે?"
         }.get(language, "And the patient's name?")
 
@@ -322,7 +337,75 @@ async def _handle_booking_flow(
     return reply
 
 
+async def _handle_lead_flow(
+    call: ActiveCall, transcript: str, language: str, category: str
+) -> str:
+    from app.services.lead_service import advance_lead_state
+    
+    next_state, step_prompt, is_complete = advance_lead_state(call.session_id, transcript)
+
+    if is_complete:
+        reply = {
+            "en": "Thank you. I have registered your details. Dr. Mayank Joshi will contact you shortly to plan the camp.",
+            "hi": "धन्यवाद। मैंने आपकी जानकारी दर्ज कर ली है। डॉ. मयंक जोशी जल्द ही आपसे संपर्क करेंगे।",
+            "gu": "આભાર. મેં તમારી માહિતી નોંધવી લીધી છે. ડૉ. મયંક જોશી ટૂંક સમયમાં તમારો સંપર્ક કરશે."
+        }.get(language, "Thank you. Dr. Mayank will contact you.")
+        db_service.append_message(call.session_id, "assistant", reply)
+        return reply
+
+    system_prompt = build_system_prompt(mode="voice")
+    history = db_service.get_conversation_history(call.session_id)
+    reply = await generate_response(
+        user_message=transcript,
+        conversation_history=history[:-1],
+        system_prompt=system_prompt,
+        injected_context=f"[INQUIRY FLOW — CURRENT STEP]: {step_prompt}",
+    )
+    db_service.append_message(call.session_id, "assistant", reply)
+    return reply
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def _process_text_stream(call: ActiveCall, text_generator, language: str, category: str):
+    buffer = ""
+    full_reply = ""
+    
+    async for chunk in text_generator:
+        buffer += chunk
+        full_reply += chunk
+        
+        # Split on sentence boundaries (period, question mark, exclamation, Hindi purna viram)
+        sentences = re.split(r'([.!?।॥]+(?:\s+|\n|$))', buffer)
+        
+        # Process ALL complete sentences in the buffer
+        while len(sentences) >= 3:
+            complete_sentence = sentences[0] + sentences[1]
+            buffer = "".join(sentences[2:])
+            sentences = re.split(r'([.!?।॥]+(?:\s+|\n|$))', buffer)
+            
+            clean_sentence = complete_sentence.strip()
+            if clean_sentence:
+                audio_b64, mime = await _synthesize_to_b64(clean_sentence, language)
+                if audio_b64:
+                    await _send_tts(call, clean_sentence, audio_b64, mime, language)
+                    
+    # Flush remaining buffer
+    clean_buffer = buffer.strip()
+    if clean_buffer:
+        audio_b64, mime = await _synthesize_to_b64(clean_buffer, language)
+        if audio_b64:
+            await _send_tts(call, clean_buffer, audio_b64, mime, language)
+            
+    # Auto-adjust language for next turns
+    reply_lang = detect_language(full_reply)
+    if reply_lang in ("en", "hi", "gu"):
+        call.language = reply_lang
+        
+    db_service.append_message(call.session_id, "assistant", full_reply.strip())
+    db_service.update_session_meta(
+        call.session_id, language=call.language, query_category=category
+    )
 
 async def _synthesize_to_b64(text: str, language: str) -> tuple[str, str]:
     """Convert text to audio. Returns (base64_string, mime_type)."""

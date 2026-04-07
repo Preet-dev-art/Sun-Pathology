@@ -5,7 +5,7 @@ from app.config import settings
 
 genai.configure(api_key=settings.GEMINI_API_KEY)
 
-# Use gemini-1.5-flash — fastest, cheapest, 1M context window
+# Use gemini-2.5-flash — fastest, cheapest, 1M context window
 # Perfect for passing full conversation history every turn
 _model = genai.GenerativeModel(
     model_name="gemini-2.5-flash",
@@ -68,3 +68,29 @@ async def generate_response(
     response = await chat.send_message_async(enriched_message)
 
     return response.text.strip()
+
+
+async def generate_response_stream(
+    user_message: str,
+    conversation_history: list[dict],
+    system_prompt: str,
+    injected_context: str = ""
+):
+    model = genai.GenerativeModel(
+        model_name="gemini-2.5-flash",
+        system_instruction=system_prompt,
+    )
+
+    if injected_context:
+        enriched_message = f"{injected_context}\n\nPatient message: {user_message}"
+    else:
+        enriched_message = user_message
+
+    gemini_history = build_gemini_history(conversation_history)
+    chat = model.start_chat(history=gemini_history)
+    
+    # Send message with streaming enabled
+    response = await chat.send_message_async(enriched_message, stream=True)
+    async for chunk in response:
+        if chunk.text:
+            yield chunk.text

@@ -240,6 +240,7 @@ lab_info = {
             "debit_card": True,
             "pos_at_lab": True,
             "online": True,
+            "policy": "You can make payment in the following ways: Credit card or debit card from our website, UPI payment through our website, POS machine at the laboratory premises, or Cash payment at the laboratory.",
             "insurance": "Tie-up with select insurance panels",
             "gst": False,
             "gst_note": "No GST charged — Sun Pathology is classified as a medical firm"
@@ -274,28 +275,25 @@ lab_info = {
         "escalation_number": "9276843433",
         "website": "www.sunpathology.in"
     },
-
-    "faq": {
-        "रिपोर्ट कब मिलेगी": "ज्यादातर रिपोर्ट्स उसी दिन तैयार हो जाती हैं, कुछ स्पेशल टेस्ट में 48-72 घंटे लग सकते हैं।",
-        "फास्टिंग कितने घंटे": "लिपिड प्रोफाइल, फास्टिंग शुगर, और होमियोसिस्टीन के लिए 10-12 घंटे खाली पेट रहना होता है। 12 घंटे से ज्यादा फास्टिंग न करें।",
-        "होम कलेक्शन कैसे बुक करें": "079-67006700 पर कॉल करें। सुबह 6 बजे से रात 8 बजे के बीच सैंपल कलेक्ट किया जाएगा।",
-        "क्या रविवार को खुले हैं": "हाँ, रविवार को भी सुबह 7 बजे से रात 8 बजे तक खुले हैं।",
-        "ऑनलाइन रिपोर्ट कैसे देखें": "व्हाट्सएप पर PDF भेज दी जाती है। ऑनलाइन पोर्टल पर भी देख सकते हैं।",
-        "What time does the lab open": "Sun Pathology centers open at 7 AM. Sample collection starts from 6 AM.",
-        "Do you provide home collection": "Yes, we provide home sample collection across Ahmedabad from 6 AM to 8 PM.",
-        "How will I receive my report": "Reports are delivered via WhatsApp (PDF), SMS, Email, and the website portal.",
-        "How long does it take to get reports": "Most routine tests are ready the same day. Some special tests take 24-72 hours.",
-        "Do I need fasting for blood tests": "Only certain tests require fasting — Lipid Profile and Fasting Sugar need 10-12 hours. Most others do not.",
-        "Do you accept digital payments": "Yes — UPI, credit cards, debit cards, and online payments are all accepted.",
-        "Is Sun Pathology NABL certified": "Sun Pathology follows NABL quality standards and uses US FDA-approved diagnostic technology.",
-        "Can I book a full body check-up": "Yes, we have multiple full body packages. The most popular starts at 2499 rupees.",
-        "What is the contact number": "You can reach us at 079-67006700.",
-        "How many branches do you have": "Sun Pathology has 10 centers across Ahmedabad — Science City, Thaltej, Satellite, Akhbarnagar, Maninagar, Bopal, Gota, Vastral, Shahibaug, and Sattadhar.",
-        "Do I need an appointment": "No appointment needed for walk-in. Just come in between 7 AM and 8 PM.",
-        "Is GST charged": "No, Sun Pathology is a medical firm — GST is not applicable.",
-        "What is the refund policy": "Refunds are processed only for cancellations made before sample collection."
-    }
+    "faq": {} # Deprecated: FAQ logic has moved to faq_database.json for 900+ multi-lingual scaling
 }
+
+import os
+import json
+FAQ_DB_CACHE = None
+
+def load_faq_database():
+    global FAQ_DB_CACHE
+    if FAQ_DB_CACHE is not None:
+        return FAQ_DB_CACHE
+    
+    db_path = os.path.join(os.path.dirname(__file__), "faq_database.json")
+    try:
+        with open(db_path, "r", encoding="utf-8") as f:
+            FAQ_DB_CACHE = json.load(f)
+    except FileNotFoundError:
+        FAQ_DB_CACHE = {"en": {}, "hi": {}, "gu": {}}
+    return FAQ_DB_CACHE
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -382,23 +380,89 @@ category_keywords = {
 
 def detect_language(text: str) -> str:
     """
-    Detect the primary language of a message.
+    Detect the primary language of a message using GRAMMAR, not just script.
+
+    The Sarvam STT often transcribes Hindi speech using Gujarati letters when
+    the session language is set to 'gu'. So we cannot rely on Unicode ranges
+    alone. Instead we check for common Hindi function words (written in both
+    Devanagari AND Gujarati script) to detect when Hindi grammar is present
+    despite Gujarati letters.
 
     Returns:
-        "hi" — Hindi (Devanagari script detected)
-        "gu" — Gujarati (Gujarati script detected)
+        "hi" — Hindi grammar detected (regardless of script)
+        "gu" — Gujarati grammar detected
         "en" — English (default)
-
-    Note: For mixed (Hinglish/Gujlish), returns the script-based detection.
-    The system prompt handles mixed-language responses natively.
     """
     if not text:
         return "en"
 
+    text_lower = text.lower().strip()
+
+    # ── Step 1: Check for Hindi grammar words written in GUJARATI script ──
+    # These are extremely common Hindi function words that do NOT exist in
+    # natural Gujarati. If we find them, it's Hindi spoken & mis-transcribed.
+    hindi_words_in_gujarati_script = [
+        # Pronouns / particles
+        "મુજે", "મૈં", "મૈ", "મેરા", "મેરી", "મેરે",
+        "હમ", "હમારા", "હમારી", "હમારે", "હમે", "હમેં",
+        "આપકા", "આપકી", "આપકે", "આપકો", "તુમ", "તુમ્હારા",
+        # Verbs / auxiliaries
+        "હૈ", "હૈં", "હું", "થા", "થી", "થે",
+        "કરના", "કરતા", "કરતી", "કરો", "કરે", "કરેં",
+        "ચાહિએ", "ચાહતા", "ચાહતી",
+        "હોતા", "હોતી", "હોતે",
+        "બતાઓ", "બતાઈએ", "બોલો",
+        "દીજિએ", "કીજિએ", "લીજિએ",
+        "સકતા", "સકતી", "સકતે",
+        "કરવાના", "કરાના", "કરવાની",
+        # Common Hindi postpositions
+        "કા", "કી", "કે", "સે", "મેં", "પર", "કો",
+        "વાલા", "વાલી", "વાલે",
+        # Question words
+        "ક્યા", "કૈસે", "કૈસા", "કૈસી",
+        "કિતના", "કિતની", "કિતને",
+        "કબ", "કહાં", "કિસ", "કિસકા",
+        # Common verbs / phrases
+        "કરવાના", "કરાના", "જાનના", "જાનકારી",
+        "દેના", "લેના", "આના", "જાના",
+        "પતા", "માલૂમ",
+        # Negation
+        "નહીં", "નહિ", "મત",
+        # Conjunctions
+        "ઔર", "યા", "લેકિન", "ઇસલિએ",
+    ]
+
+    # ── Step 2: Check for Hindi grammar words in Devanagari script ──
+    hindi_words_in_devanagari = [
+        "मुझे", "मैं", "मेरा", "मेरी", "हम", "हमें",
+        "आपका", "आपकी", "तुम", "है", "हैं", "था", "थी",
+        "करना", "चाहिए", "बताइए", "बताओ", "दीजिए",
+        "क्या", "कैसे", "कितना", "कब", "कहाँ",
+        "नहीं", "और", "या", "लेकिन",
+        "करवाना", "जानकारी", "जानना",
+    ]
+
+    # Tokenize the text
+    words = text_lower.split()
+
+    # Count grammar matches
+    hindi_gu_script_hits = sum(1 for w in words if w in hindi_words_in_gujarati_script)
+    hindi_dev_hits = sum(1 for w in words if w in hindi_words_in_devanagari)
+
+    # ── Step 3: Script-based counting ──
     gujarati_count = sum(1 for ch in text if '\u0A80' <= ch <= '\u0AFF')
     devanagari_count = sum(1 for ch in text if '\u0900' <= ch <= '\u097F')
+    latin_count = sum(1 for ch in text if 'a' <= ch.lower() <= 'z')
 
-    if gujarati_count > 0:
+    # ── Step 4: Decision logic ──
+    # If Hindi grammar words are found (in either script), it's Hindi
+    if hindi_dev_hits > 0:
+        return "hi"
+    if hindi_gu_script_hits >= 1:
+        return "hi"
+
+    # Pure script-based fallback
+    if gujarati_count > devanagari_count and gujarati_count > latin_count:
         return "gu"
     if devanagari_count > 0:
         return "hi"
@@ -466,18 +530,33 @@ def get_nearest_branch(area_query: str) -> Optional[dict]:
 def get_faq_answer(query: str) -> Optional[str]:
     """
     Try to answer from FAQ directly before calling Gemini.
-    Returns the answer string if found, None otherwise.
-
-    Use this to short-circuit Gemini for simple, deterministic questions.
+    Reads from the highly scalable trilingual faq_database.json.
     """
     if not query:
         return None
 
     query_lower = query.lower().strip()
 
-    for question, answer in lab_info["faq"].items():
-        if question.lower() in query_lower or query_lower in question.lower():
-            return answer
+    # ── Guard against negations (false positives) ──────────────
+    negation_words = {"not", "nahi", "nathi", "don't", "dont", "no"}
+    query_words = set(query_lower.split())
+    if query_words.intersection(negation_words):
+        # If the user says "I do NOT want...", let Gemini handle the nuance
+        return None
+
+    faq_db = load_faq_database()
+    
+    # ── Match across all languages ──────────────
+    for lang_dict in faq_db.values():
+        for question, answer in lang_dict.items():
+            question_lower = question.lower()
+            # Strict match for very short queries to prevent false positives
+            if len(query_lower) < 10:
+                if query_lower == question_lower:
+                    return answer
+            # Flexible match for normal length
+            elif question_lower in query_lower or query_lower in question_lower:
+                return answer
 
     # Common patterns not in FAQ keys
     if any(w in query_lower for w in ["sunday", "रविवार", "રવિવાર"]):

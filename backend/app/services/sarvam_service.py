@@ -88,7 +88,7 @@ async def text_to_speech(text: str, language: str = "hi") -> bytes:
         "inputs": [text],
         "target_language_code": lang_code,
         "speaker": speaker,
-        "pace": 1.1,             # Slightly faster than default — natural receptionist pace
+        "pace": 1.15,            # Safe pace slightly above 1.1
         "speech_sample_rate": 22050,
         "enable_preprocessing": True,
         "model": "bulbul:v3",    # Sarvam's TTS model

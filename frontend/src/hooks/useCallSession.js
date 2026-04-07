@@ -41,8 +41,8 @@ const VAD_CONFIG = {
   positiveSpeechThreshold: 0.5,
   negativeSpeechThreshold: 0.35,
   minSpeechFrames:         5,
-  redemptionFrames:        15,
-  preSpeechPadFrames:      5,
+  redemptionFrames:        10,
+  preSpeechPadFrames:      3,
 };
 
 // Interruption sensitivity — separate from VAD.
@@ -69,6 +69,8 @@ export function useCallSession({ sessionId }) {
   const streamRef        = useRef(null);
   const audioContextRef  = useRef(null);   // kept — used in _cleanup and interruption check
   const currentAudioRef  = useRef(null);
+  const audioQueueRef    = useRef([]);
+  const isPlayingRef     = useRef(false);
   const isSpeakingRef    = useRef(false);
   const durationTimerRef = useRef(null);
   const languageRef      = useRef("");
@@ -93,6 +95,16 @@ export function useCallSession({ sessionId }) {
   const _interruptRef             = useRef(null);
 
   // ── Sync state → refs (identical to original) ────────────────────────────
+  // ── Reset state when sessionId changes ──────────────────────────────
+  useEffect(() => {
+    setMessages([]);
+    setTranscript("");
+    setSheetalText("");
+    setCallDuration(0);
+    setCallState("idle");
+    setError("");
+  }, [sessionId]);
+
   useEffect(() => { isSpeakingRef.current = callState === "speaking"; }, [callState]);
   useEffect(() => { languageRef.current = language; },                  [language]);
 
@@ -103,7 +115,6 @@ export function useCallSession({ sessionId }) {
     setError("");
     setTranscript("");
     setSheetalText("");
-    setMessages([]);
     setCallDuration(0);
     setCallState("ringing");
 
@@ -126,78 +137,8 @@ export function useCallSession({ sessionId }) {
     }
 
     // Step 2: Set up Silero VAD — REPLACES the AudioContext/analyser block
-    //
-    // MicVAD.new() opens its own AudioContext internally.
-    // It reads from the stream, runs Silero inference on each 30ms frame,
-    // and fires onSpeechStart / onSpeechEnd at the right moments.
-    //
-    // onSpeechEnd receives a Float32Array of the complete utterance audio
-    // (already resampled to 16kHz mono by the VAD library).
-    // We convert that Float32Array → WAV bytes → base64 → send over WebSocket.
-    try {
-      const vad = await MicVAD.new({
-        stream:           stream,
-        baseAssetPath:    "/",   // load silero_vad_legacy.onnx from public root
-        onnxWASMBasePath: "/",   // MicVAD sets ort.env.wasm.wasmPaths to this before init;
-                                 // must be "/" so WASM files load from public/ not deps cache
-        ort,
-        ...VAD_CONFIG,
-
-        onSpeechStart: () => {
-          // Visual feedback — user started speaking
-          // Don't change callState here if Sheetal is speaking (interruption path handles that)
-          if (!isSpeakingRef.current) {
-            setCallState("listening");
-          }
-        },
-
-        onSpeechEnd: async (audioFloat32) => {
-          // audioFloat32 is a Float32Array at 16kHz mono — clean, VAD-trimmed
-          // Convert to WAV bytes and send over WebSocket
-          if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-
-          const wavBytes = _float32ToWav(audioFloat32, 16000);
-          const base64   = _bytesToBase64(wavBytes);
-
-          wsRef.current.send(JSON.stringify({
-            type:     "audio",
-            data:     base64,
-            language: languageRef.current || "hi",
-            mime:     "audio/wav",   // tell backend it's WAV, not WebM
-          }));
-          setCallState("thinking");
-        },
-
-        onVADMisfire: () => {
-          // Silero thought it heard speech but ended too quickly — noise burst
-          // Just stay in listening state, nothing to send
-          setCallState("listening");
-        },
-      });
-
-      vadRef.current = vad;
-      // Don't start yet — wait for WebSocket to connect first
-    } catch (e) {
-      console.error("VAD init error:", e);
-      setError("Voice detection failed to load. Please refresh and try again.");
-      setCallState("error");
-      stream.getTracks().forEach(t => t.stop());
-      return;
-    }
-
-    // Step 2b: Set up a SEPARATE AudioContext for interruption detection only.
-    // We need to detect when user speaks while Sheetal's audio is playing.
-    // The Silero VAD pauses during Sheetal's speech (via _stopListening),
-    // so we need this lightweight check to catch the interruption signal.
-    const interruptCtx      = new AudioContext();
-    audioContextRef.current = interruptCtx;
-    const interruptSource   = interruptCtx.createMediaStreamSource(stream);
-    const interruptAnalyser = interruptCtx.createAnalyser();
-    interruptAnalyser.fftSize = 512;
-    interruptSource.connect(interruptAnalyser);
-    interruptAnalyserRef.current = interruptAnalyser;
-
-    // Step 3: Open WebSocket — IDENTICAL to original
+    // Step 2: Open WebSocket IMMEDIATELY to trigger the backend greeting logic
+    // This allows the server to synthesize TTS *in parallel* while the neural VAD builds.
     const ws = new WebSocket(`${API_WS_BASE}/api/call/ws/${sessionId}`);
     wsRef.current = ws;
 
@@ -206,6 +147,11 @@ export function useCallSession({ sessionId }) {
       durationTimerRef.current = setInterval(() => {
         setCallDuration(d => d + 1);
       }, 1000);
+      
+      // If VAD finished setting up before the websocket opened, start it now.
+      if (vadRef.current) {
+        _startListeningRef.current?.();
+      }
     };
 
     ws.onmessage = (event) => {
@@ -222,6 +168,64 @@ export function useCallSession({ sessionId }) {
       setCallState(prev => prev !== "ended" ? "ended" : prev);
       _cleanupRef.current?.();
     };
+
+    // Step 3: Set up a SEPARATE AudioContext for interruption detection only.
+    const interruptCtx      = new AudioContext();
+    audioContextRef.current = interruptCtx;
+    const interruptSource   = interruptCtx.createMediaStreamSource(stream);
+    const interruptAnalyser = interruptCtx.createAnalyser();
+    interruptAnalyser.fftSize = 512;
+    interruptSource.connect(interruptAnalyser);
+    interruptAnalyserRef.current = interruptAnalyser;
+
+    // Step 4: Set up Silero VAD
+    // MicVAD.new() takes 1-2 seconds the first time it loads.
+    try {
+      const vad = await MicVAD.new({
+        stream:           stream,
+        baseAssetPath:    "/",
+        onnxWASMBasePath: "/",
+        ort,
+        ...VAD_CONFIG,
+
+        onSpeechStart: () => {
+          if (!isSpeakingRef.current) {
+            setCallState("listening");
+          }
+        },
+
+        onSpeechEnd: async (audioFloat32) => {
+          if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+
+          const wavBytes = _float32ToWav(audioFloat32, 16000);
+          const base64   = _bytesToBase64(wavBytes);
+
+          wsRef.current.send(JSON.stringify({
+            type:     "audio",
+            data:     base64,
+            language: languageRef.current || "hi",
+            mime:     "audio/wav",
+          }));
+          setCallState("thinking");
+        },
+
+        onVADMisfire: () => {
+          setCallState("listening");
+        },
+      });
+
+      vadRef.current = vad;
+      // If WebSocket already connected while the 1-2s VAD build was happening, start listening!
+      if (ws.readyState === WebSocket.OPEN) {
+        _startListeningRef.current?.();
+      }
+    } catch (e) {
+      console.error("VAD init error:", e);
+      setError("Voice detection failed to load. Please refresh and try again.");
+      setCallState("error");
+      stream.getTracks().forEach(t => t.stop());
+      return;
+    }
   }, [sessionId]);
 
   // ── Handle server messages — IDENTICAL to original ───────────────────────
@@ -236,14 +240,27 @@ export function useCallSession({ sessionId }) {
         setTranscript(msg.text);
         setLanguage(msg.language || "");
         setCallState("thinking");
+        setSheetalText(""); // Clear previous sheetal text for the new response
         setMessages(prev => [...prev, { role: "user", text: msg.text, time: new Date() }]);
         break;
 
       case "tts_audio":
-        setSheetalText(msg.reply_text || "");
+        setSheetalText(prev => prev ? prev + " " + (msg.reply_text || "") : (msg.reply_text || ""));
         setLanguage(msg.language || "");
         if (msg.reply_text) {
-          setMessages(prev => [...prev, { role: "sheetal", text: msg.reply_text, time: new Date() }]);
+          setMessages(prev => {
+            const newArr = [...prev];
+            const lastIndex = newArr.length - 1;
+            const last = newArr[lastIndex];
+            if (last && last.role === "sheetal") {
+              // Creating a new immutable object prevents React Strict Mode from applying
+              // the text update twice on the same memory reference.
+              newArr[lastIndex] = { ...last, text: last.text + " " + msg.reply_text };
+            } else {
+              newArr.push({ role: "sheetal", text: msg.reply_text, time: new Date() });
+            }
+            return newArr;
+          });
         }
         _playSheetalRef.current?.(msg.audio_b64, msg.mime || "audio/wav");
         break;
@@ -292,45 +309,6 @@ export function useCallSession({ sessionId }) {
   // CHANGED: one line — _stopRecordingRef.current?.() → _stopListeningRef.current?.()
   // Everything else identical.
 
-  const _playSheetal = useCallback((audio_b64, mime) => {
-    if (!audio_b64) return;
-
-    if (currentAudioRef.current) {
-      currentAudioRef.current.pause();
-      currentAudioRef.current = null;
-    }
-
-    // CHANGED: pause Silero VAD instead of stopping MediaRecorder
-    _stopListeningRef.current?.();
-    setCallState("speaking");
-
-    // Start interruption detector — lightweight RMS check while Sheetal speaks
-    _startInterruptionWatch();
-
-    const byteChars = atob(audio_b64);
-    const bytes     = new Uint8Array(byteChars.length);
-    for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i);
-    const blob = new Blob([bytes], { type: mime });
-    const url  = URL.createObjectURL(blob);
-    const audio = new Audio(url);
-    currentAudioRef.current = audio;
-
-    const onDone = () => {
-      URL.revokeObjectURL(url);
-      currentAudioRef.current = null;
-      clearInterval(interruptIntervalRef.current);
-      interruptIntervalRef.current = null;
-      setCallState("listening");
-      _startListeningRef.current?.();
-    };
-
-    audio.onended = onDone;
-    audio.onerror = onDone;
-    audio.play().catch(onDone);
-  }, []);
-
-  _playSheetalRef.current = _playSheetal;
-
   // ── Interruption detector (runs only while Sheetal is speaking) ───────────
   // CHANGED: this was embedded in the VAD interval loop in the original.
   // Now it's a separate concern — Silero is paused, so we use a simple
@@ -364,9 +342,67 @@ export function useCallSession({ sessionId }) {
     }, INTERRUPT_INTERVAL_MS);
   }, []);
 
+  const _processAudioQueue = useCallback(() => {
+    if (audioQueueRef.current.length === 0) {
+      isPlayingRef.current = false;
+      URL.revokeObjectURL(currentAudioRef.current?.src || "");
+      currentAudioRef.current = null;
+      clearInterval(interruptIntervalRef.current);
+      interruptIntervalRef.current = null;
+      setCallState("listening");
+      _startListeningRef.current?.();
+      return;
+    }
+
+    isPlayingRef.current = true;
+    const { audio_b64, mime } = audioQueueRef.current.shift();
+
+    const byteChars = atob(audio_b64);
+    const bytes     = new Uint8Array(byteChars.length);
+    for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i);
+    const blob = new Blob([bytes], { type: mime });
+    const url  = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    
+    // Boost playback speed slightly for all languages to sound more natural
+    audio.playbackRate = 1.15;
+    
+    currentAudioRef.current = audio;
+
+    const onDone = () => {
+      URL.revokeObjectURL(url);
+      _processAudioQueue();
+    };
+
+    audio.onended = onDone;
+    audio.onerror = onDone;
+    audio.play().catch(onDone);
+  }, []);
+
+  const _playSheetal = useCallback((audio_b64, mime) => {
+    if (!audio_b64) return;
+
+    // Add to queue
+    audioQueueRef.current.push({ audio_b64, mime });
+    
+    // Pause listening the very first time we queue something
+    if (audioQueueRef.current.length === 1 && !isPlayingRef.current) {
+      _stopListeningRef.current?.();
+      setCallState("speaking");
+      _startInterruptionWatch();
+      _processAudioQueue();
+    }
+  }, [_startInterruptionWatch, _processAudioQueue]);
+
+  _playSheetalRef.current = _playSheetal;
+
+
   // ── Interruption — IDENTICAL to original ─────────────────────────────────
 
   const _interrupt = useCallback(() => {
+    audioQueueRef.current = [];
+    isPlayingRef.current = false;
+    
     if (currentAudioRef.current) {
       currentAudioRef.current.pause();
       currentAudioRef.current = null;
@@ -401,6 +437,9 @@ export function useCallSession({ sessionId }) {
     clearInterval(durationTimerRef.current);
     clearInterval(interruptIntervalRef.current);   // CHANGED: was vadIntervalRef + silenceTimerRef
 
+    audioQueueRef.current = [];
+    isPlayingRef.current = false;
+    
     if (currentAudioRef.current) {
       currentAudioRef.current.pause();
       currentAudioRef.current = null;

@@ -29,6 +29,8 @@ def get_or_create_session(session_id: str) -> dict:
         "query_category": "GENERAL",
         "booking_state": None,
         "booking_data": {},
+        "lead_state": None,
+        "lead_data": {},
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -94,6 +96,20 @@ def get_booking_state(session_id: str) -> tuple[Optional[str], dict]:
     if doc.exists:
         data = doc.to_dict()
         return data.get("booking_state"), data.get("booking_data", {})
+    return None, {}
+
+
+def get_lead_state(session_id: str) -> tuple[Optional[str], dict]:
+    """
+    Returns (lead_state, lead_data) for the session.
+    lead_state is None if no lead collection is in progress.
+    """
+    db = get_db()
+    doc = db.collection("chat_sessions").document(session_id).get()
+
+    if doc.exists:
+        data = doc.to_dict()
+        return data.get("lead_state"), data.get("lead_data", {})
     return None, {}
 
 

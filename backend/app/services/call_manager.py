@@ -10,7 +10,7 @@ from fastapi import WebSocket
 class ActiveCall:
     session_id: str
     websocket: WebSocket
-    language: str = "hi"              # detected/updated as call progresses
+    language: str = "gu"              # detected/updated as call progresses
     sheetal_speaking: bool = False    # True while TTS audio is being sent to client
     processing: bool = False          # True while STT+Gemini is running
     ended: bool = False
