@@ -1,0 +1,28 @@
+# Environment & secrets
+.env
+*.env.*
+
+# Firebase service account (NEVER commit)
+sunpathalogy-firebase-adminsdk-fbsvc-b80c0428bd.json
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Node
+node_modules/
+dist/
+dist-ssr/
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+Thumbs.db
