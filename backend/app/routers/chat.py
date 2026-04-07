@@ -90,7 +90,12 @@ async def chat(request: ChatRequest):
             injected_context=injected_context,
         )
     except Exception as e:
-        print(f"GEMINI ERROR: {e}")
+        import traceback
+        error_details = traceback.format_exc()
+        print("====== GEMINI ERROR ======", flush=True)
+        print(f"Error Message: {e}", flush=True)
+        print(f"Traceback:\n{error_details}", flush=True)
+        print("==========================", flush=True)
         # Graceful degradation — Sheetal apologises and gives contact number
         reply = _fallback_response(language)
 

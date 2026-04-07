@@ -220,7 +220,12 @@ async def _handle_patient_audio(call: ActiveCall, msg: dict):
                     injected_context=injected_context,
                 )
             except Exception as e:
-                print(f"[CALL {call.session_id}] Gemini error: {e}")
+                import traceback
+                error_details = traceback.format_exc()
+                print(f"====== [CALL {call.session_id}] GEMINI ERROR ======", flush=True)
+                print(f"Error Message: {e}", flush=True)
+                print(f"Traceback:\n{error_details}", flush=True)
+                print("===================================", flush=True)
                 reply_text = _fallback(language)
 
             # ── Save reply ────────────────────────────────────────────────
